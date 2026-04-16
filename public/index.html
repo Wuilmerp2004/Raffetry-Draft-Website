@@ -887,7 +887,6 @@ function fileToBase64(file) {
 async function startTagging() {
   const apiKey = document.getElementById('apiKey').value.trim();
   if (!apiKey) { alert('Please enter your Gemini API key.'); return; }
-  if (!apiKey.startsWith('AIza')) { alert('That doesn\'t look like a Gemini API key (should start with AIza…).'); return; }
 
   const fileInput = document.getElementById('videoFiles');
   if (!fileInput.files.length) { alert('Please select at least one video file.'); return; }
