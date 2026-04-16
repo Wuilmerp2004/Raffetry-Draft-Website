@@ -238,7 +238,7 @@ app.post('/api/tag', async (req, res) => {
 // ── POST /api/tag-batch — multiple videos in parallel ────────────────────────
 // Body: JSON { apiKey, files: [{ filename, mimetype, dataBase64 }, ...] }
 // Returns a stream of newline-delimited JSON (one result per line as they finish)
-app.post('/api/tag-batch', express.json({ limit: '500mb' }), async (req, res) => {
+app.post('/api/tag-batch', express.json({ limit: '2gb' }), async (req, res) => {
   const { apiKey, files } = req.body;
   if (!apiKey || !Array.isArray(files) || !files.length)
     return res.status(400).json({ error: 'Missing apiKey or files array' });
