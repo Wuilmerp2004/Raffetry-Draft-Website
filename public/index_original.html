@@ -132,6 +132,10 @@
     .tag { font-size: 10px; font-family: 'Syne', sans-serif; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 2px; }
     .tag-type   { background: rgba(27,58,107,0.1);  color: var(--accent); }
     .tag-sector { background: rgba(201,168,76,0.15); color: #8B6914; }
+    .tag-status-Approved     { background: rgba(39,174,96,0.12);  color: var(--green); }
+    .tag-status-Rejected     { background: rgba(192,57,43,0.12);  color: var(--red); }
+    .tag-status-Pending      { background: rgba(107,114,128,0.12); color: var(--gray); }
+    .tag-status-NeedsReview  { background: rgba(230,126,34,0.12); color: var(--orange); }
     .card-title { font-family: 'Syne', sans-serif; font-size: 14px; font-weight: 700; color: var(--navy); margin-bottom: 6px; line-height: 1.3; }
     .card-desc { font-size: 12px; color: var(--gray); line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .card-footer { padding: 10px 16px; border-top: 1px solid var(--light); display: flex; align-items: center; justify-content: space-between; }
@@ -199,6 +203,13 @@
     .modal-field dd { font-size: 13px; color: var(--navy); line-height: 1.5; }
     .keywords-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
     .kw-pill { background: var(--cream); border: 1px solid var(--light); font-size: 11px; padding: 3px 10px; border-radius: 20px; color: var(--navy); }
+    .modal-qa-row { display: flex; gap: 10px; margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--light); align-items: center; flex-wrap: wrap; }
+    .modal-qa-row label { font-size: 11px; font-weight: 500; letter-spacing: 0.07em; text-transform: uppercase; color: var(--gray); white-space: nowrap; }
+    .modal-qa-row select, .modal-qa-row input { padding: 8px 12px; border: 1px solid var(--light); border-radius: 3px; background: var(--cream); font-family: 'DM Sans', sans-serif; font-size: 13px; color: var(--navy); }
+    .modal-qa-row select { width: 160px; }
+    .modal-qa-row input { flex: 1; min-width: 140px; }
+    .modal-qa-row select:focus, .modal-qa-row input:focus { outline: none; border-color: var(--gold); }
+
     /* ── EMPTY STATE ── */
     .empty-state { text-align: center; padding: 80px 40px; color: var(--gray); }
     .empty-state .icon { font-size: 48px; margin-bottom: 16px; opacity: 0.4; }
@@ -317,6 +328,13 @@
         <label>Quality Rating</label>
         <select id="f_quality" onchange="applyFilters()">
           <option value="">All Qualities</option><option>High</option><option>Medium</option><option>Low</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>QA Status</label>
+        <select id="f_qaStatus" onchange="applyFilters()">
+          <option value="">All Statuses</option>
+          <option>Approved</option><option>Pending</option><option>Rejected</option><option>Needs Review</option>
         </select>
       </div>
       <button class="btn btn-ghost" onclick="resetFilters()">↺ Clear All Filters</button>
@@ -475,7 +493,7 @@ const METADATA_FIELDS = [
   'age_groups_present','languages_spoken','has_captions',
   'music_present','logo_or_brand_visible','call_to_action',
   'keywords','decade_or_era','quality_rating','notes',
-  'tagged_by','tagged_at'
+  'qa_status','qa_notes','tagged_by','tagged_at'
 ];
 
 const SUPPORTED_EXTS = new Set(['.mp4','.mov','.avi','.mkv','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp']);
@@ -584,6 +602,7 @@ function applyFilters() {
   const tone   = gv('f_tone');
   const style  = gv('f_visualStyle');
   const qual   = gv('f_quality');
+  const qa     = gv('f_qaStatus');
 
   filteredVideos = allVideos.filter(v => {
     if (kw    && !`${v.title} ${v.keywords} ${v.description} ${v.file_name}`.toLowerCase().includes(kw)) return false;
@@ -596,6 +615,7 @@ function applyFilters() {
     if (tone   && v.tone !== tone) return false;
     if (style  && v.visual_style !== style) return false;
     if (qual   && v.quality_rating !== qual) return false;
+    if (qa     && v.qa_status !== qa) return false;
     return true;
   });
   renderResults();
@@ -603,7 +623,7 @@ function applyFilters() {
 
 function resetFilters() {
   ['f_contentType','f_primarySubject','f_industrySector','f_targetAudience',
-   'f_language','f_hasCaptions','f_tone','f_visualStyle','f_quality']
+   'f_language','f_hasCaptions','f_tone','f_visualStyle','f_quality','f_qaStatus']
     .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   document.getElementById('keywordInput').value = '';
   applyFilters();
@@ -625,6 +645,10 @@ function fmtDur(secs) {
   return `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
 }
 
+function qaTagClass(status) {
+  return 'tag-status-' + (status || 'Pending').replace(' ','');
+}
+
 function renderResults() {
   const c = document.getElementById('resultsContainer');
   document.getElementById('resultCount').textContent = filteredVideos.length;
@@ -642,7 +666,7 @@ function renderResults() {
   c.innerHTML = filteredVideos.map((v, i) => {
     const dur  = fmtDur(v.duration_seconds);
     const qual = v.quality_rating || '';
-    const qc   = '';
+    const qc   = qaTagClass(v.qa_status);
 
     if (currentView === 'list') return `
       <div class="card" onclick="showModal(${i})" style="animation-delay:${i*0.04}s">
@@ -656,6 +680,7 @@ function renderResults() {
             <div class="card-meta-row">
               <span class="tag tag-type">${v.content_type || 'Unknown'}</span>
               ${v.industry_sector ? `<span class="tag tag-sector">${v.industry_sector}</span>` : ''}
+              <span class="tag ${qc}">${v.qa_status || 'Pending'}</span>
             </div>
             <div class="card-title">${v.title || v.file_name}</div>
             <div class="card-desc">${v.description || ''}</div>
@@ -684,6 +709,7 @@ function renderResults() {
           <div class="card-icons">
             ${v.has_captions === 'Yes' ? '<span class="icon-pill" title="Captions">CC</span>' : ''}
             ${v.music_present === 'Yes' ? '<span class="icon-pill" title="Music">♪</span>' : ''}
+            <span class="tag ${qc}">${v.qa_status || ''}</span>
           </div>
         </div>
       </div>`;
@@ -701,6 +727,8 @@ function showModal(idx) {
   const kws  = (v.keywords || '').split('|').filter(Boolean);
   const subs = (v.secondary_subjects || '').split('|').filter(Boolean);
   const ages = (v.age_groups_present || '').split('|').filter(Boolean);
+  const qaColors = { Approved:'#27AE60', Rejected:'#C0392B', Pending:'#6B7280', 'Needs Review':'#E67E22' };
+  const qaColor  = qaColors[v.qa_status] || '#333';
 
   const field = (label, val) => (val && val !== 'None' && val !== '') ? `
     <dl class="modal-field"><dt>${label}</dt><dd>${val}</dd></dl>` : '';
@@ -727,6 +755,11 @@ function showModal(idx) {
       ${field('Call to Action', v.call_to_action)}
       ${field('Quality Rating', v.quality_rating)}
       ${field('Decade / Era', v.decade_or_era)}
+      <dl class="modal-field">
+        <dt>QA Status</dt>
+        <dd style="color:${qaColor};font-weight:600">${v.qa_status || '—'}</dd>
+      </dl>
+      ${field('QA Notes', v.qa_notes)}
       ${field('AI Notes', v.notes)}
       ${field('Tagged By', v.tagged_by)}
       ${field('Tagged At', v.tagged_at ? new Date(v.tagged_at).toLocaleString() : '')}
@@ -734,9 +767,30 @@ function showModal(idx) {
       ${kws.length ? `<dl class="modal-field full"><dt>Keywords</dt><dd>
         <div class="keywords-wrap">${kws.map(k => `<span class="kw-pill">${k}</span>`).join('')}</div>
       </dd></dl>` : ''}
+    </div>
+    <div class="modal-qa-row">
+      <label>Update QA:</label>
+      <select id="qaSelect">
+        <option>Approved</option><option>Pending</option><option>Rejected</option><option>Needs Review</option>
+      </select>
+      <input type="text" id="qaNoteInput" placeholder="QA notes…" value="${v.qa_notes || ''}">
+      <button class="btn btn-primary" style="padding:8px 16px;font-size:11px" onclick="saveQA('${v.file_name}')">Save</button>
     </div>`;
 
+  const sel = document.getElementById('qaSelect');
+  if (sel) sel.value = v.qa_status || 'Pending';
   document.getElementById('modalOverlay').classList.add('open');
+}
+
+function saveQA(fileName) {
+  const status = document.getElementById('qaSelect').value;
+  const notes  = document.getElementById('qaNoteInput').value;
+  [allVideos, filteredVideos, taggingResults].forEach(arr => {
+    const row = arr.find(r => r.file_name === fileName);
+    if (row) { row.qa_status = status; row.qa_notes = notes; }
+  });
+  closeModalDirect();
+  renderResults();
 }
 
 function closeModal(e)  { if (e.target === document.getElementById('modalOverlay')) closeModalDirect(); }
@@ -802,6 +856,8 @@ function buildRow(file, aiData, error = null) {
     file_size_mb: (file.size / (1024 * 1024)).toFixed(2),
     tagged_by:    'Gemini AI',
     tagged_at:    new Date().toISOString(),
+    qa_status:    error ? 'Needs Review' : 'Pending',
+    qa_notes:     '',
   });
   if (error) {
     row.notes = `[ERROR] ${error}`;
@@ -811,6 +867,18 @@ function buildRow(file, aiData, error = null) {
     });
   }
   return row;
+}
+
+/**
+ * Read a File as a base64 string.
+ */
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -852,20 +920,30 @@ async function startTagging() {
   document.getElementById('downloadBar').classList.remove('visible');
   document.getElementById('logBox').innerHTML = '';
   document.getElementById('progressStatus').innerHTML =
-    `<span class="spinner"></span> Uploading ${files.length} file(s) to server…`;
+    `<span class="spinner"></span> Reading ${files.length} file(s) into memory…`;
   setProgress(0, files.length);
 
-  log(`Sending ${files.length} video(s) to server…`, 'info');
+  // Read all files to base64 first (fast, local)
+  log(`Reading ${files.length} file(s)…`, 'info');
+  const filePayloads = await Promise.all(files.map(async f => {
+    const mime = (f.type && f.type.startsWith('video/'))
+      ? f.type : (MIME_MAP[f.name.split('.').pop().toLowerCase()] || 'video/mp4');
+    return { filename: f.name, mimetype: mime, dataBase64: await fileToBase64(f), size: f.size };
+  }));
 
-  // Build multipart FormData — browser streams files directly, no base64 conversion
-  const form = new FormData();
-  form.append('apiKey', apiKey);
-  files.forEach(f => form.append('files', f, f.name));
+  log(`Sending to server — processing ${files.length} video(s) in parallel…`, 'info');
+  document.getElementById('progressStatus').innerHTML =
+    `<span class="spinner"></span> Uploading & analyzing ${files.length} video(s) in parallel…`;
 
   taggingResults = [];
   let success = 0, failed = 0, done = 0;
 
-  const res = await fetch('/api/tag-batch', { method: 'POST', body: form });
+  // POST to /api/tag-batch — server streams back NDJSON as each video finishes
+  const res = await fetch('/api/tag-batch', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ apiKey, files: filePayloads }),
+  });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -875,7 +953,7 @@ async function startTagging() {
     return;
   }
 
-  // Read streaming NDJSON response — results arrive as each video finishes
+  // Read the streaming NDJSON response line by line
   const reader  = res.body.getReader();
   const decoder = new TextDecoder();
   let   buffer  = '';
@@ -884,8 +962,9 @@ async function startTagging() {
     const { value, done: streamDone } = await reader.read();
     if (value) buffer += decoder.decode(value, { stream: true });
 
+    // Process all complete lines
     const lines = buffer.split('\n');
-    buffer = lines.pop();
+    buffer = lines.pop(); // keep incomplete last line
 
     for (const line of lines) {
       if (!line.trim()) continue;
@@ -910,7 +989,7 @@ async function startTagging() {
       setProgress(done, files.length);
       document.getElementById('progressStatus').innerHTML =
         done < files.length
-          ? `<span class="spinner"></span> ${done}/${files.length} done…`
+          ? `<span class="spinner"></span> ${done}/${files.length} done — ${files.length - done} in progress…`
           : `Done — ${success} succeeded, ${failed} failed.`;
     }
 

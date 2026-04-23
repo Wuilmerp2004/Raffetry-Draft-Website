@@ -1,5 +1,9 @@
 import express from 'express';
 import https from 'https';
+import { execFile } from 'child_process';
+import { tmpdir } from 'os';
+import { writeFile, readFile, unlink } from 'fs/promises';
+import { randomBytes } from 'crypto';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
@@ -7,34 +11,96 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_MODEL = 'gemini-2.5-flash';
-
-// How many videos to upload+analyze at the same time.
-// Free tier: 10 req/min → keep at 3. Paid tier: bump to 8–10.
-const CONCURRENCY = 8;
+const CONCURRENCY  = 5;
 
 // ── Static frontend ───────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// ── HTTPS helper ──────────────────────────────────────────────────────────────
 function httpsRequest(options, body = null) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({
-        status:  res.statusCode,
-        headers: res.headers,
-        body:    Buffer.concat(chunks),
-      }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
     });
     req.on('error', reject);
-    req.setTimeout(300_000, () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(600_000, () => { req.destroy(); reject(new Error('Timeout')); });
     if (body) req.write(body);
     req.end();
   });
 }
 
+// ── Multipart parser ──────────────────────────────────────────────────────────
+function splitBuffer(buf, delimiter) {
+  const parts = [];
+  let start = 0;
+  while (true) {
+    const idx = buf.indexOf(delimiter, start);
+    if (idx === -1) { parts.push(buf.slice(start)); break; }
+    parts.push(buf.slice(start, idx));
+    start = idx + delimiter.length;
+  }
+  return parts.filter(p => p.length > 4);
+}
+
+function parseMultipart(rawBody, boundary) {
+  const fields = {};
+  const files  = [];
+  const parts  = splitBuffer(rawBody, Buffer.from('\r\n' + boundary));
+  for (const part of parts) {
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+    const headerStr = part.slice(0, headerEnd).toString();
+    const bodyBuf   = part.slice(headerEnd + 4);
+    const body      = bodyBuf.slice(-2).toString() === '\r\n' ? bodyBuf.slice(0, -2) : bodyBuf;
+    const nameMatch = headerStr.match(/name="([^"]+)"/);
+    if (!nameMatch) continue;
+    const name     = nameMatch[1];
+    const fileMatch = headerStr.match(/filename="([^"]+)"/);
+    if (fileMatch) {
+      const mimeMatch = headerStr.match(/Content-Type:\s*([^\r\n]+)/i);
+      files.push({ fieldname: name, filename: fileMatch[1], mimetype: (mimeMatch?.[1] || 'video/mp4').trim(), buffer: body });
+    } else {
+      fields[name] = body.toString().trim();
+    }
+  }
+  return { fields, files };
+}
+
+// ── FFmpeg compression ────────────────────────────────────────────────────────
+async function ffmpegAvailable() {
+  return new Promise(resolve => execFile('ffmpeg', ['-version'], err => resolve(!err)));
+}
+async function compressVideo(inputBuffer, mime) {
+  const id         = randomBytes(8).toString('hex');
+  const ext        = mime.includes('quicktime') ? 'mov' : 'mp4';
+  const inPath     = path.join(tmpdir(), `rwm_in_${id}.${ext}`);
+  const outPath    = path.join(tmpdir(), `rwm_out_${id}.mp4`);
+  const sizeMb     = inputBuffer.length / 1024 / 1024;
+  const resolution = sizeMb > 100 ? '240' : '360';
+  const fps        = sizeMb > 100 ? '5' : '15';
+  const crf        = sizeMb > 100 ? '32' : '28';
+
+  await writeFile(inPath, inputBuffer);
+  await new Promise((resolve, reject) => {
+    execFile('ffmpeg', [
+      '-i', inPath,
+      '-vf', `scale=-2:${resolution}`,
+      '-c:v', 'libx264', '-crf', crf, '-preset', 'ultrafast',
+      '-r', fps,
+      '-c:a', 'aac', '-b:a', '64k',
+      '-movflags', '+faststart',
+      '-y', outPath
+    ], { timeout: 300_000 }, err => err ? reject(err) : resolve());
+  });
+  const compressed = await readFile(outPath);
+  await unlink(inPath).catch(() => {});
+  await unlink(outPath).catch(() => {});
+  return compressed;
+}
+
+// ── Gemini prompt ─────────────────────────────────────────────────────────────
 const ANALYSIS_PROMPT = `You are a professional video archivist for RaffertyWeiss Media (RWM).
 Analyze this video and return ONLY valid JSON with these exact keys — no markdown, no extra text:
 {
@@ -70,14 +136,30 @@ function parseAIResponse(raw) {
   throw new Error('Could not parse Gemini JSON response');
 }
 
-// ── Core: tag a single video buffer ──────────────────────────────────────────
+// ── Core: tag one video buffer ────────────────────────────────────────────────
 async function tagVideo(apiKey, filename, mime, fileBuffer) {
+  // Compress if ffmpeg available and file > 50MB
+  const sizeMb = fileBuffer.length / 1024 / 1024;
+  if (sizeMb > 50) {
+    const hasFfmpeg = await ffmpegAvailable();
+    if (hasFfmpeg) {
+      console.log(`[${filename}] Compressing ${sizeMb.toFixed(0)}MB → 360p…`);
+      try {
+        fileBuffer = await compressVideo(fileBuffer, mime);
+        mime = 'video/mp4';
+        console.log(`[${filename}] Compressed to ${(fileBuffer.length/1024/1024).toFixed(0)}MB`);
+      } catch (e) {
+        console.warn(`[${filename}] Compression failed, uploading original: ${e.message}`);
+      }
+    }
+  }
+
   // 1. Initiate resumable upload
   const initBody = JSON.stringify({ file: { display_name: filename } });
   const initResp = await httpsRequest({
     hostname: 'generativelanguage.googleapis.com',
-    path: `/upload/v1beta/files?uploadType=resumable&key=${apiKey}`,
-    method: 'POST',
+    path:     `/upload/v1beta/files?uploadType=resumable&key=${apiKey}`,
+    method:   'POST',
     headers: {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(initBody),
@@ -95,10 +177,10 @@ async function tagVideo(apiKey, filename, mime, fileBuffer) {
   if (!uploadUrl) throw new Error('Gemini did not return an upload URL');
 
   // 2. Upload bytes
-  const uploadUrlParsed = new URL(uploadUrl);
+  const up = new URL(uploadUrl);
   const uploadResp = await httpsRequest({
-    hostname: uploadUrlParsed.hostname,
-    path:     uploadUrlParsed.pathname + uploadUrlParsed.search,
+    hostname: up.hostname,
+    path:     up.pathname + up.search,
     method:   'POST',
     headers: {
       'Content-Length': fileBuffer.length,
@@ -111,59 +193,61 @@ async function tagVideo(apiKey, filename, mime, fileBuffer) {
   if (uploadResp.status !== 200)
     throw new Error(`Upload failed (${uploadResp.status}): ${uploadResp.body.toString()}`);
 
-  let fileInfo = JSON.parse(uploadResp.body.toString()).file;
+  const uploadJson = JSON.parse(uploadResp.body.toString());
+  let fileInfo = uploadJson.file || uploadJson;
 
-  // 3. Poll until ACTIVE — 1s interval (down from 3s)
+  // 3. Poll until ACTIVE
   let attempts = 0;
-  while (fileInfo.state === 'PROCESSING' && attempts < 120) {
-    await new Promise(r => setTimeout(r, 1000));
+  while (fileInfo.state === 'PROCESSING' && attempts < 240) {
+    await new Promise(r => setTimeout(r, 500));
     const pollResp = await httpsRequest({
       hostname: 'generativelanguage.googleapis.com',
       path:     `/v1beta/${fileInfo.name}?key=${apiKey}`,
       method:   'GET',
       headers:  { 'Content-Type': 'application/json' },
     });
-    fileInfo = JSON.parse(pollResp.body.toString());
+    const pollJson = JSON.parse(pollResp.body.toString());
+    fileInfo = pollJson.file || pollJson;
     attempts++;
   }
   if (fileInfo.state === 'FAILED')
     throw new Error(`Gemini failed to process ${filename}`);
 
-  // 4. Analyze — maxOutputTokens 2048 is plenty for JSON, responds faster
+  // Validate URI
+  console.log(`[${filename}] fileInfo:`, JSON.stringify({ name: fileInfo.name, uri: fileInfo.uri, state: fileInfo.state, mimeType: fileInfo.mimeType }));
+  if (!fileInfo.uri || !fileInfo.uri.startsWith('https://')) {
+    throw new Error(`Gemini returned invalid file URI: "${fileInfo.uri}"`);
+  }
+
+  // 4. Analyze
   let aiData = null, lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const genBody = JSON.stringify({
-      contents: [{
-        parts: [
-          { file_data: { mime_type: fileInfo.mimeType || mime, file_uri: fileInfo.uri } },
-          { text: ANALYSIS_PROMPT },
-        ]
-      }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+      contents: [{ parts: [
+        { file_data: { mime_type: fileInfo.mimeType || mime, file_uri: fileInfo.uri } },
+        { text: ANALYSIS_PROMPT },
+      ]}],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
     });
-
     const genResp = await httpsRequest({
       hostname: 'generativelanguage.googleapis.com',
       path:     `/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
       method:   'POST',
-      headers: {
-        'Content-Type':   'application/json',
-        'Content-Length': Buffer.byteLength(genBody),
-      },
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(genBody) },
     }, genBody);
 
     if (genResp.status !== 200) {
-      lastErr = `Gemini generateContent failed (${genResp.status}): ${genResp.body.toString()}`;
+      lastErr = `Gemini error (${genResp.status}): ${genResp.body.toString()}`;
       await new Promise(r => setTimeout(r, 3000));
       continue;
     }
-
     const rawText = JSON.parse(genResp.body.toString())?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    console.log(`[${filename}] Gemini response:\n${rawText}\n`);
     try { aiData = parseAIResponse(rawText); break; }
     catch (e) { lastErr = e.message; await new Promise(r => setTimeout(r, 3000)); }
   }
 
-  // 5. Delete from Gemini (fire and forget)
+  // 5. Delete from Gemini
   httpsRequest({
     hostname: 'generativelanguage.googleapis.com',
     path:     `/v1beta/${fileInfo.name}?key=${apiKey}`,
@@ -175,125 +259,70 @@ async function tagVideo(apiKey, filename, mime, fileBuffer) {
   return aiData;
 }
 
-// ── Multipart parser ──────────────────────────────────────────────────────────
-function splitBuffer(buf, delimiter) {
-  const parts = [];
-  let start = 0;
-  while (true) {
-    const idx = buf.indexOf(delimiter, start);
-    if (idx === -1) { parts.push(buf.slice(start)); break; }
-    parts.push(buf.slice(start, idx));
-    start = idx + delimiter.length;
-  }
-  return parts.filter(p => p.length > 4);
-}
+// ── POST /api/tag-batch ───────────────────────────────────────────────────────
+// Receives all videos as multipart/form-data in one request.
+// Streams back NDJSON as each video finishes.
+app.post('/api/tag-batch', (req, res) => {
+  const contentType   = req.headers['content-type'] || '';
+  const boundaryMatch = contentType.match(/boundary=(.+)$/);
+  if (!boundaryMatch) return res.status(400).json({ error: 'Expected multipart/form-data' });
 
-function parseMultipart(rawBody, boundary) {
-  const fields = {};
-  let fileBuffer = null;
-  const parts = splitBuffer(rawBody, Buffer.from('\r\n' + boundary));
-  for (const part of parts) {
-    const headerEnd = part.indexOf('\r\n\r\n');
-    if (headerEnd === -1) continue;
-    const headerStr = part.slice(0, headerEnd).toString();
-    const bodyBuf   = part.slice(headerEnd + 4);
-    const body = bodyBuf.slice(-2).toString() === '\r\n' ? bodyBuf.slice(0, -2) : bodyBuf;
-    const nameMatch = headerStr.match(/name="([^"]+)"/);
-    if (!nameMatch) continue;
-    if (nameMatch[1] === 'file') fileBuffer = body;
-    else fields[nameMatch[1]] = body.toString().trim();
-  }
-  return { fields, fileBuffer };
-}
-
-// ── POST /api/tag — single video ──────────────────────────────────────────────
-app.post('/api/tag', async (req, res) => {
-  try {
-    const contentType  = req.headers['content-type'] || '';
-    const boundaryMatch = contentType.match(/boundary=(.+)$/);
-    if (!boundaryMatch) return res.status(400).json({ error: 'Expected multipart/form-data' });
-
-    const rawBody = await new Promise((resolve, reject) => {
-      const chunks = [];
-      req.on('data', c => chunks.push(c));
-      req.on('end',  () => resolve(Buffer.concat(chunks)));
-      req.on('error', reject);
-    });
-
-    const { fields, fileBuffer } = parseMultipart(rawBody, '--' + boundaryMatch[1]);
-    const { apiKey, filename, mimetype } = fields;
-    if (!apiKey || !fileBuffer || !filename)
-      return res.status(400).json({ error: 'Missing apiKey, file, or filename' });
-
-    const mime   = mimetype || 'video/mp4';
-    const aiData = await tagVideo(apiKey, filename, mime, fileBuffer);
-
-    res.json({ ok: true, aiData, fileSizeMb: (fileBuffer.length / 1024 / 1024).toFixed(2) });
-  } catch (err) {
-    console.error('/api/tag error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── POST /api/tag-batch — multiple videos in parallel ────────────────────────
-// Body: JSON { apiKey, files: [{ filename, mimetype, dataBase64 }, ...] }
-// Returns a stream of newline-delimited JSON (one result per line as they finish)
-app.post('/api/tag-batch', express.json({ limit: '2gb' }), async (req, res) => {
-  const { apiKey, files } = req.body;
-  if (!apiKey || !Array.isArray(files) || !files.length)
-    return res.status(400).json({ error: 'Missing apiKey or files array' });
-
-  // Stream results back as newline-delimited JSON so the UI can update live
   res.setHeader('Content-Type', 'application/x-ndjson');
   res.setHeader('Transfer-Encoding', 'chunked');
   res.flushHeaders();
 
-  // Run up to CONCURRENCY jobs at once
-  const queue = [...files];
-  let active  = 0;
-  let done    = 0;
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('error', err => { res.write(JSON.stringify({ ok: false, error: err.message }) + '\n'); res.end(); });
+  req.on('end', async () => {
+    const rawBody = Buffer.concat(chunks);
+    const { fields, files } = parseMultipart(rawBody, '--' + boundaryMatch[1]);
+    const apiKey = fields.apiKey;
 
-  await new Promise(resolve => {
-    function next() {
-      while (active < CONCURRENCY && queue.length) {
-        const f = queue.shift();
-        active++;
-        const buf = Buffer.from(f.dataBase64, 'base64');
-
-        tagVideo(apiKey, f.filename, f.mimetype || 'video/mp4', buf)
-          .then(aiData => {
-            res.write(JSON.stringify({
-              ok:          true,
-              filename:    f.filename,
-              fileSizeMb:  (buf.length / 1024 / 1024).toFixed(2),
-              aiData,
-            }) + '\n');
-          })
-          .catch(err => {
-            res.write(JSON.stringify({
-              ok:       false,
-              filename: f.filename,
-              error:    err.message,
-            }) + '\n');
-          })
-          .finally(() => {
-            active--;
-            done++;
-            if (queue.length) next();
-            else if (active === 0) resolve();
-          });
-      }
+    if (!apiKey || !files.length) {
+      res.write(JSON.stringify({ ok: false, error: 'Missing apiKey or files' }) + '\n');
+      return res.end();
     }
-    next();
-  });
 
-  res.end();
+    // Process up to CONCURRENCY at once
+    const queue  = [...files];
+    let active   = 0;
+    let total    = files.length;
+    let finished = 0;
+
+    await new Promise(resolve => {
+      function next() {
+        while (active < CONCURRENCY && queue.length) {
+          const f = queue.shift();
+          active++;
+          tagVideo(apiKey, f.filename, f.mimetype, f.buffer)
+            .then(aiData => {
+              res.write(JSON.stringify({
+                ok: true, filename: f.filename,
+                fileSizeMb: (f.buffer.length / 1024 / 1024).toFixed(2),
+                aiData,
+              }) + '\n');
+            })
+            .catch(err => {
+              res.write(JSON.stringify({ ok: false, filename: f.filename, error: err.message }) + '\n');
+            })
+            .finally(() => {
+              active--;
+              finished++;
+              if (queue.length) next();
+              else if (active === 0) resolve();
+            });
+        }
+      }
+      next();
+    });
+
+    res.end();
+  });
 });
 
 // ── Catch-all → index.html ────────────────────────────────────────────────────
-app.get('*', (_, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 app.listen(PORT, () => {
   console.log(`\n  RWM Video Archive`);
