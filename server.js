@@ -1,4 +1,5 @@
 import express from 'express';
+import http from 'http';
 import https from 'https';
 import { execFile } from 'child_process';
 import { tmpdir } from 'os';
@@ -277,6 +278,10 @@ app.post('/api/tag-batch', (req, res) => {
   req.on('end', async () => {
     const rawBody = Buffer.concat(chunks);
     const { fields, files } = parseMultipart(rawBody, '--' + boundaryMatch[1]);
+    const totalMb = (rawBody.length / 1024 / 1024).toFixed(1);
+    const usedMb = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+    const rss = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+    console.log(`Upload received: ${totalMb}MB — Heap: ${usedMb}MB — RSS: ${rss}MB`);
     const apiKey = fields.apiKey;
 
     if (!apiKey || !files.length) {
@@ -324,7 +329,9 @@ app.post('/api/tag-batch', (req, res) => {
 // ── Catch-all → index.html ────────────────────────────────────────────────────
 app.get('*', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-app.listen(PORT, () => {
+const server = http.createServer(app);
+server.maxRequestsPerSocket = 0;
+server.listen(PORT, () => {
   console.log(`\n  RWM Video Archive`);
   console.log(`  http://localhost:${PORT}`);
   console.log(`  Concurrency: ${CONCURRENCY} videos at once`);
