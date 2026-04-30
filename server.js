@@ -79,14 +79,15 @@ async function compressVideo(inputBuffer, mime) {
   const inPath     = path.join(tmpdir(), `rwm_in_${id}.${ext}`);
   const outPath    = path.join(tmpdir(), `rwm_out_${id}.mp4`);
   const sizeMb     = inputBuffer.length / 1024 / 1024;
-  const resolution = sizeMb > 100 ? '240' : '360';
-  const fps        = sizeMb > 100 ? '5' : '15';
-  const crf        = sizeMb > 100 ? '32' : '28';
+  const resolution = sizeMb > 100 ? '128' : '360';
+  const fps        = sizeMb > 100 ? '1' : '15';
+  const crf        = sizeMb > 100 ? '35' : '28';
 
   await writeFile(inPath, inputBuffer);
   await new Promise((resolve, reject) => {
     execFile('ffmpeg', [
       '-i', inPath,
+      '-t', '120',
       '-vf', `scale=-2:${resolution}`,
       '-c:v', 'libx264', '-crf', crf, '-preset', 'ultrafast',
       '-r', fps,
