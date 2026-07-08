@@ -1,5 +1,7 @@
 # AI Video Metadata Tagger — RaffertyWeiss Media
 
+Link: https://rafferty-media-website.vercel.app 
+
 A full-stack application that automatically generates rich, searchable metadata for video files, built for a real media client to replace a slow manual cataloging workflow with an automated pipeline powered by Google's Gemini API.
 
 ## Overview
